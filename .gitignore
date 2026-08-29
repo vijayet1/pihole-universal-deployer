@@ -1,0 +1,15 @@
+# Environment and secrets
+.env
+*.env
+*.key
+*.crt
+
+# Tailscale and Pi-hole state mounts
+tailscale-state/
+etc-pihole/
+etc-dnsmasq.d/
+
+# Temporary / OS files
+.DS_Store
+*.tmp
+*.log

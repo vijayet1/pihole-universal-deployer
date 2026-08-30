@@ -122,9 +122,25 @@ else
   ((PASSED++)) || true
 fi
 
+# Test 21: Uninstaller with purge option
+out=$("${SCRIPT}" --mode uninstall --dir "${TEST_DIR}/uninstall-test" --purge-system --dry-run)
+assert_contains "${out}" "Restoring system DNS and sysctl settings" "Test 21: Uninstaller purges system configurations"
+
+# Test 22: Uninstaller without purge option
+out=$("${SCRIPT}" --mode uninstall --dir "${TEST_DIR}/uninstall-test2" --dry-run)
+assert_contains "${out}" "Pi-hole deployment has been uninstalled." "Test 22: Uninstaller succeeds without purge"
+if [[ "${out}" == *"Restoring system DNS and sysctl settings"* ]]; then
+  echo "  [FAIL] Test 23: Uninstaller should not purge system configs when --purge-system is omitted"
+  ((FAILED++)) || true
+else
+  echo "  [PASS] Test 23: Uninstaller omits system rollback when --purge-system is omitted"
+  ((PASSED++)) || true
+fi
+
 echo ""
 echo "Test Results: ${PASSED} Passed, ${FAILED} Failed"
 if (( FAILED > 0 )); then
   exit 1
 fi
+
 

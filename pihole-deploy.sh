@@ -39,6 +39,7 @@ TAILSCALE_KEY=""
 TAILSCALE_TAG="tag:pihole"
 HTTP_PORT="8080"
 ENABLE_SYSTEMD="true"
+PURGE_SYSTEM="false"
 DRY_RUN="false"
 
 # --- Helper: Privilege Escalation ---
@@ -465,21 +466,50 @@ run_uninstall() {
   log_step "Uninstalling and Removing Pi-hole Stack"
 
   # 1. Stop Containers if running
-  if command -v podman &>/dev/null; then
-    podman rm -f pihole tailscale-pihole 2>/dev/null || true
-  fi
-  if command -v docker &>/dev/null; then
-    docker rm -f pihole tailscale-pihole 2>/dev/null || true
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    log_info "[DRY-RUN] Would remove containers if running."
+  elif [[ -n "${CONTAINER_ENGINE}" ]]; then
+    "${CONTAINER_ENGINE}" rm -f pihole tailscale-pihole 2>/dev/null || true
+  else
+    if command -v podman &>/dev/null; then
+      podman rm -f pihole tailscale-pihole 2>/dev/null || true
+    elif command -v docker &>/dev/null; then
+      docker rm -f pihole tailscale-pihole 2>/dev/null || true
+    fi
   fi
 
   # 2. Standalone Pi-hole removal if installed
   if command -v pihole &>/dev/null; then
-    log_info "Found host Pi-hole binary. Calling pihole uninstall..."
+    log_info "Calling host pihole uninstall..."
     run_privileged pihole uninstall || true
   fi
 
-  # 3. Clean files if user confirms
-  if [[ -d "${TARGET_DIR}" ]]; then
+  # 3. System Rollback & Purge
+  if [[ "${PURGE_SYSTEM}" == "true" ]]; then
+    log_step "Restoring system DNS and sysctl settings..."
+    local sysctl_conf="/etc/sysctl.d/50-pihole-unprivileged-ports.conf"
+    if [[ -f "${sysctl_conf}" ]] || [[ "${DRY_RUN}" == "true" ]]; then
+      run_privileged rm -f "${sysctl_conf}"
+      run_privileged sysctl --system >/dev/null 2>&1 || true
+    fi
+
+    local resolved_dir="/etc/systemd/resolved.conf.d"
+    run_privileged rm -f "${resolved_dir}/no-stub.conf"
+    if [[ -f "${resolved_dir}/20-docker-dns.conf.disabled" ]] || [[ "${DRY_RUN}" == "true" ]]; then
+      run_privileged mv "${resolved_dir}/20-docker-dns.conf.disabled" "${resolved_dir}/20-docker-dns.conf"
+    fi
+    run_privileged systemctl restart systemd-resolved 2>/dev/null || true
+
+    if systemctl is-active --quiet caddy 2>/dev/null || [[ "${DRY_RUN}" == "true" ]]; then
+      run_privileged systemctl stop caddy || true
+      run_privileged systemctl disable caddy || true
+    fi
+  fi
+
+  # 4. Clean deployment directory
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    log_info "[DRY-RUN] Would remove deployment directory: ${TARGET_DIR}"
+  elif [[ -d "${TARGET_DIR}" ]]; then
     log_warn "Removing deployment directory: ${TARGET_DIR}"
     rm -rf "${TARGET_DIR}"
   fi
@@ -592,6 +622,13 @@ run_interactive_wizard() {
       ;;
     4)
       DEPLOY_MODE="uninstall"
+      read -rp "Target Directory to remove [${TARGET_DIR}]: " input_dir
+      TARGET_DIR="${input_dir:-$TARGET_DIR}"
+      TARGET_DIR="${TARGET_DIR/#\~/$HOME}"
+      read -rp "Purge system DNS, sysctl settings, and stop Caddy? (y/N): " purge_choice
+      if [[ "${purge_choice}" =~ ^[Yy]$ ]]; then
+        PURGE_SYSTEM="true"
+      fi
       ;;
     *)
       log_error "Invalid selection. Exiting."
@@ -628,6 +665,7 @@ Options:
   --tailscale-tag <tag>    Tag for OAuth key (default: tag:pihole)
   --port <port>            Host port for Web UI in container mode (default: 8080)
   --timezone <tz>          Timezone string (e.g. Europe/Berlin, UTC)
+  --purge-system           Rollback system DNS, sysctl configs, and Caddy on uninstall
   --healthcheck            Run diagnostics on existing installation
   --dry-run                Show deployment plan without executing commands
   -h, --help               Show this help message
@@ -689,6 +727,10 @@ parse_args() {
       --timezone)
         TIMEZONE="$2"
         shift 2
+        ;;
+      --purge-system)
+        PURGE_SYSTEM="true"
+        shift
         ;;
       --healthcheck)
         run_healthcheck

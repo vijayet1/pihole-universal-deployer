@@ -65,7 +65,7 @@ generate_secure_password() {
   if command -v openssl &>/dev/null; then
     openssl rand -hex 16
   else
-    tr -dc 'A-Za-z0-9!#%_+=' < /dev/urandom | head -c 24 || echo "PiHole$(date +%s)Sec!"
+    LC_ALL=C tr -dc 'A-Za-z0-9!#%_+=' < /dev/urandom | (head -c 32; true)
   fi
 }
 
@@ -638,7 +638,7 @@ parse_args() {
         shift 2
         ;;
       --password-stdin)
-        read -r ADMIN_PASSWORD
+        IFS= read -r ADMIN_PASSWORD || [[ -n "${ADMIN_PASSWORD}" ]]
         shift
         ;;
       --domain)

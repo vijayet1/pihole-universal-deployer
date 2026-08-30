@@ -91,6 +91,11 @@ echo "StdinPassword123!" | "${SCRIPT}" --mode container --dir "${TEST_DIR}/sec-s
 stdin_val=$(grep "^WEBPASSWORD=" "${TEST_DIR}/sec-stdin/.env" | cut -d'=' -f2)
 assert_contains "${stdin_val}" "StdinPassword123!" "Test 13: Ingests password from --password-stdin"
 
+# Test 14: Password via Stdin without Trailing Newline
+printf "NoNewlinePass456!" | "${SCRIPT}" --mode container --dir "${TEST_DIR}/sec-nonl" --password-stdin --dry-run
+stdin_val2=$(grep "^WEBPASSWORD=" "${TEST_DIR}/sec-nonl/.env" | cut -d'=' -f2)
+assert_contains "${stdin_val2}" "NoNewlinePass456!" "Test 14: Ingests password from stdin without trailing newline"
+
 echo ""
 echo "Test Results: ${PASSED} Passed, ${FAILED} Failed"
 if (( FAILED > 0 )); then

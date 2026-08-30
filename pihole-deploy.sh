@@ -60,6 +60,15 @@ run_privileged() {
   fi
 }
 
+# --- Helper: Secure Password Generation ---
+generate_secure_password() {
+  if command -v openssl &>/dev/null; then
+    openssl rand -hex 16
+  else
+    tr -dc 'A-Za-z0-9!#%_+=' < /dev/urandom | head -c 24 || echo "PiHole$(date +%s)Sec!"
+  fi
+}
+
 # --- System Detection ---
 detect_environment() {
   log_step "Detecting Environment & System Capabilities"
@@ -230,12 +239,19 @@ deploy_container() {
 
   mkdir -p "${TARGET_DIR}/etc-pihole" "${TARGET_DIR}/etc-dnsmasq.d"
 
+  if [[ -z "${ADMIN_PASSWORD}" ]]; then
+    ADMIN_PASSWORD=$(generate_secure_password)
+    log_info "Auto-generated secure Pi-hole admin password: ${ADMIN_PASSWORD}"
+  fi
+
   # 1. Create .env
   local env_file="${TARGET_DIR}/.env"
   log_info "Creating environment file: ${env_file}"
+  (umask 077 && touch "${env_file}")
+  chmod 600 "${env_file}"
   cat <<EOF > "${env_file}"
 TZ=${TIMEZONE}
-WEBPASSWORD=${ADMIN_PASSWORD:-AdminPass123!}
+WEBPASSWORD=${ADMIN_PASSWORD}
 FTLCONF_dns_listeningMode=all
 PIHOLE_DNS_1=1.1.1.1
 PIHOLE_DNS_2=8.8.8.8
@@ -300,6 +316,11 @@ deploy_tailscale_sidecar() {
 
   mkdir -p "${TARGET_DIR}/etc-pihole" "${TARGET_DIR}/etc-dnsmasq.d" "${TARGET_DIR}/tailscale-state"
 
+  if [[ -z "${ADMIN_PASSWORD}" ]]; then
+    ADMIN_PASSWORD=$(generate_secure_password)
+    log_info "Auto-generated secure Pi-hole admin password: ${ADMIN_PASSWORD}"
+  fi
+
   # Detect OAuth vs Auth Key
   local extra_args=""
   if [[ "${TAILSCALE_KEY}" == tskey-client-* ]]; then
@@ -310,15 +331,19 @@ deploy_tailscale_sidecar() {
   # 1. Create .env
   local env_file="${TARGET_DIR}/.env"
   log_info "Writing ${env_file}..."
+  (umask 077 && touch "${env_file}")
+  chmod 600 "${env_file}"
   cat <<EOF > "${env_file}"
 TS_AUTHKEY=${TAILSCALE_KEY}
 TZ=${TIMEZONE}
-WEBPASSWORD=${ADMIN_PASSWORD:-AdminPass123!}
+WEBPASSWORD=${ADMIN_PASSWORD}
 EOF
 
   # 2. Create serve.json for Tailscale Serve (HTTPS 443 -> HTTP 80)
   local serve_file="${TARGET_DIR}/serve.json"
   log_info "Writing Tailscale Serve declarative config to ${serve_file}..."
+  (umask 077 && touch "${serve_file}")
+  chmod 600 "${serve_file}"
   cat <<'EOF' > "${serve_file}"
 {
   "TCP": {
@@ -546,7 +571,7 @@ run_interactive_wizard() {
   esac
 
   if [[ "${DEPLOY_MODE}" != "uninstall" ]]; then
-    read -rsp "Set Pi-hole Admin Password [default: AdminPass123!]: " input_pass
+    read -rsp "Set Pi-hole Admin Password [leave blank to auto-generate]: " input_pass
     echo ""
     ADMIN_PASSWORD="${input_pass:-}"
   fi
@@ -568,6 +593,7 @@ Topologies:
 Options:
   --dir <path>             Target installation directory (default: ~/pihole)
   --password <password>    Pi-hole Admin Web UI password
+  --password-stdin         Read Pi-hole password from standard input
   --domain <fqdn>          Domain for Let's Encrypt HTTPS (Standalone mode)
   --tailscale-key <key>    Tailscale Auth Key (tskey-auth-...) or OAuth Secret (tskey-client-...)
   --tailscale-tag <tag>    Tag for OAuth key (default: tag:pihole)
@@ -593,6 +619,9 @@ EOF
 }
 
 parse_args() {
+  ADMIN_PASSWORD="${PIHOLE_PASSWORD:-${ADMIN_PASSWORD}}"
+  TAILSCALE_KEY="${TS_AUTHKEY:-${TAILSCALE_KEY:-${TAILSCALE_AUTHKEY:-}}}"
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --mode)
@@ -607,6 +636,10 @@ parse_args() {
       --password)
         ADMIN_PASSWORD="$2"
         shift 2
+        ;;
+      --password-stdin)
+        read -r ADMIN_PASSWORD
+        shift
         ;;
       --domain)
         CUSTOM_DOMAIN="$2"

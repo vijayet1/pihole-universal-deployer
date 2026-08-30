@@ -486,13 +486,24 @@ run_uninstall() {
   # 1. Stop Containers if running
   if [[ "${DRY_RUN}" == "true" ]]; then
     log_info "[DRY-RUN] Would remove containers if running."
-  elif [[ -n "${CONTAINER_ENGINE}" ]]; then
-    "${CONTAINER_ENGINE}" rm -f pihole tailscale-pihole 2>/dev/null || true
   else
-    if command -v podman &>/dev/null; then
-      podman rm -f pihole tailscale-pihole 2>/dev/null || true
-    elif command -v docker &>/dev/null; then
-      docker rm -f pihole tailscale-pihole 2>/dev/null || true
+    # Trigger tailscale logout to immediately deregister ephemeral nodes from control plane
+    if command -v podman &>/dev/null && podman ps --filter name=tailscale-pihole --format "{{.ID}}" 2>/dev/null | grep -q .; then
+      log_info "Logging out Tailscale node to trigger instant ephemeral deregistration..."
+      podman exec tailscale-pihole tailscale logout 2>/dev/null || true
+    elif command -v docker &>/dev/null && docker ps --filter name=tailscale-pihole --format "{{.ID}}" 2>/dev/null | grep -q .; then
+      log_info "Logging out Tailscale node to trigger instant ephemeral deregistration..."
+      docker exec tailscale-pihole tailscale logout 2>/dev/null || true
+    fi
+
+    if [[ -n "${CONTAINER_ENGINE}" ]]; then
+      "${CONTAINER_ENGINE}" rm -f pihole tailscale-pihole 2>/dev/null || true
+    else
+      if command -v podman &>/dev/null; then
+        podman rm -f pihole tailscale-pihole 2>/dev/null || true
+      elif command -v docker &>/dev/null; then
+        docker rm -f pihole tailscale-pihole 2>/dev/null || true
+      fi
     fi
   fi
 

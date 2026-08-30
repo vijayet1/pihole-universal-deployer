@@ -60,6 +60,7 @@ START_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 # Telemetry Data Stores
 AUTH_KEY_ID=""
 AUTH_KEY_TOKEN=""
+AUTH_DEVICE_ID=""
 AUTH_TS_IP=""
 AUTH_TS_FQDN=""
 AUTH_SERVE_STATUS=""
@@ -78,6 +79,7 @@ AUTH_REVOKE_STATUS="SKIPPED"
 
 OAUTH_CLIENT_ID=""
 OAUTH_CLIENT_SECRET=""
+OAUTH_DEVICE_ID=""
 OAUTH_TAG_USED="tag:pihole"
 OAUTH_TAILNET_SLUG="-"
 OAUTH_TS_IP=""
@@ -139,10 +141,10 @@ generate_final_report() {
 
 ## 📊 Summary Scorecard
 
-| Authentication Method | Key / Client ID | Tailnet IP | HTTPS :443 TLS | DNS :53 / Adblock | Healthcheck | Revocation Status |
-| :--- | :--- | :--- | :--- | :--- | :--- | :---: |
-| **Ephemeral Auth Key** | \`${AUTH_KEY_ID:-N/A}\` | \`${AUTH_TS_IP:-N/A}\` | \`${AUTH_HTTPS_PROBE:-N/A}\` | \`${AUTH_DNS_PROBE:-N/A}\` | \`${AUTH_STATUS}\` | **${AUTH_REVOKE_STATUS}** |
-| **OAuth Client Credentials** | \`${OAUTH_CLIENT_ID:-N/A}\` | \`${OAUTH_TS_IP:-N/A}\` | \`${OAUTH_HTTPS_PROBE:-N/A}\` | \`${OAUTH_DNS_PROBE:-N/A}\` | \`${OAUTH_STATUS}\` | **${OAUTH_REVOKE_STATUS}** |
+| Authentication Method | Key / Client ID | Device ID | Tailnet IP | HTTPS :443 TLS | DNS :53 / Adblock | Healthcheck | Revocation Status |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :---: |
+| **Ephemeral Auth Key** | \`${AUTH_KEY_ID:-N/A}\` | \`${AUTH_DEVICE_ID:-N/A}\` | \`${AUTH_TS_IP:-N/A}\` | \`${AUTH_HTTPS_PROBE:-N/A}\` | \`${AUTH_DNS_PROBE:-N/A}\` | \`${AUTH_STATUS}\` | **${AUTH_REVOKE_STATUS}** |
+| **OAuth Client Credentials** | \`${OAUTH_CLIENT_ID:-N/A}\` | \`${OAUTH_DEVICE_ID:-N/A}\` | \`${OAUTH_TS_IP:-N/A}\` | \`${OAUTH_HTTPS_PROBE:-N/A}\` | \`${OAUTH_DNS_PROBE:-N/A}\` | \`${OAUTH_STATUS}\` | **${OAUTH_REVOKE_STATUS}** |
 
 ---
 
@@ -152,9 +154,10 @@ generate_final_report() {
 
 - **Generated Key ID:** \`${AUTH_KEY_ID:-N/A}\`
 - **Key Prefix:** \`${AUTH_KEY_TOKEN:0:18}...\`
+- **Allocated Device ID:** \`${AUTH_DEVICE_ID:-N/A}\`
 - **Allocated Tailnet IP:** \`${AUTH_TS_IP:-N/A}\`
 - **Node FQDN:** \`${AUTH_TS_FQDN:-N/A}\`
-- **Revocation Status:** \`${AUTH_REVOKE_STATUS}\`
+- **Revocation & Purge Status:** \`${AUTH_REVOKE_STATUS}\`
 
 #### Live Network & Security Probes:
 - **Internal Web Server (Port 80):** \`${AUTH_HTTP_PROBE}\`
@@ -227,8 +230,9 @@ ${AUTH_LOGS_OUTPUT}
 - **Generated OAuth Client ID:** \`${OAUTH_CLIENT_ID:-N/A}\`
 - **Assigned ACL Tag:** \`${OAUTH_TAG_USED}\`
 - **Auto-Injected Flag:** \`--advertise-tags=${OAUTH_TAG_USED}\`
+- **Allocated Device ID:** \`${OAUTH_DEVICE_ID:-N/A}\`
 - **Allocated Tailnet IP:** \`${OAUTH_TS_IP:-N/A}\`
-- **Deletion Status:** \`${OAUTH_REVOKE_STATUS}\`
+- **Deletion & Purge Status:** \`${OAUTH_REVOKE_STATUS}\`
 
 #### Live Network & Security Probes:
 - **Internal Web Server (Port 80):** \`${OAUTH_HTTP_PROBE}\`
@@ -300,6 +304,7 @@ ${OAUTH_LOGS_OUTPUT}
 1. **Zero Cleartext Credentials:** All temporary tokens and secrets were revoked immediately following live verification.
 2. **Webserver Port Isolation:** Pi-hole v6 was constrained to internal HTTP port 80 (\`FTLCONF_webserver_port=80\`), preventing TLS socket collision on port 443.
 3. **Automated TLS Termination:** \`tailscale serve\` terminated Let's Encrypt HTTPS on port 443 and proxied traffic internally to Pi-hole port 80.
+4. **Immediate Node Deregistration:** Executed clean \`tailscale logout\` and device purge API calls to eliminate orphan devices.
 REPORT_EOF
 
   echo "================================================================================"
@@ -386,8 +391,10 @@ if [[ -n "${TS_API_KEY}" ]]; then
 
     AUTH_TS_IP=$(podman exec tailscale-pihole tailscale ip -4 2>/dev/null || echo "")
     AUTH_TS_FQDN=$(podman exec tailscale-pihole tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' || echo "")
+    AUTH_DEVICE_ID=$(podman exec tailscale-pihole tailscale status --json 2>/dev/null | jq -r '.Self.ID // empty' || echo "")
     AUTH_SERVE_STATUS=$(podman exec tailscale-pihole tailscale serve status 2>&1 || true)
 
+    echo "  [INFO] Tailscale Node ID: ${AUTH_DEVICE_ID:-Waiting for ID}"
     echo "  [INFO] Tailscale Node IP: ${AUTH_TS_IP:-Waiting for IP}"
     echo "  [INFO] Tailscale FQDN: ${AUTH_TS_FQDN:-Waiting for FQDN}"
 
@@ -435,7 +442,7 @@ if [[ -n "${TS_API_KEY}" ]]; then
 
     echo ""
     echo "==> [STAGE 5/6] Verification Complete for Phase 1."
-    confirm_action "Phase 1 (Auth Key: ${AUTH_KEY_ID}, Tailnet IP: ${AUTH_TS_IP:-N/A}) is verified and live. Ready to destroy container and revoke Auth Key?"
+    confirm_action "Phase 1 (Auth Key: ${AUTH_KEY_ID}, Node: ${AUTH_DEVICE_ID:-N/A}, Tailnet IP: ${AUTH_TS_IP:-N/A}) is verified and live. Ready to destroy container, revoke Auth Key, and purge device?"
 
     echo ""
     echo "==> [STAGE 6/6] Tearing down Phase 1 container stack and revoking Auth Key..."
@@ -444,8 +451,14 @@ if [[ -n "${TS_API_KEY}" ]]; then
     DEL_RESP=$(curl -s -w "\n%{http_code}" -X DELETE "https://api.tailscale.com/api/v2/tailnet/-/keys/${AUTH_KEY_ID}" \
       -H "Authorization: Bearer ${TS_API_KEY}")
     DEL_CODE=$(echo "${DEL_RESP}" | tail -n 1)
+
+    if [[ -n "${AUTH_DEVICE_ID}" ]]; then
+      curl -s -X DELETE "https://api.tailscale.com/api/v2/device/${AUTH_DEVICE_ID}" \
+        -H "Authorization: Bearer ${TS_API_KEY}" >/dev/null 2>&1 || true
+    fi
+
     if [[ "${DEL_CODE}" -eq 200 || "${DEL_CODE}" -eq 204 ]]; then
-      echo "  [✓] Auth Key ${AUTH_KEY_ID} revoked and deleted from Tailscale control plane."
+      echo "  [✓] Auth Key ${AUTH_KEY_ID} revoked and node deregistered from Tailscale control plane."
       AUTH_REVOKE_STATUS="DELETED (HTTP ${DEL_CODE})"
     else
       echo "  [!] Auth Key delete returned HTTP ${DEL_CODE}"
@@ -563,8 +576,10 @@ if [[ -n "${OAUTH_CLIENT_SECRET}" ]]; then
 
   OAUTH_TS_IP=$(podman exec tailscale-pihole tailscale ip -4 2>/dev/null || echo "")
   OAUTH_TS_FQDN=$(podman exec tailscale-pihole tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' || echo "")
+  OAUTH_DEVICE_ID=$(podman exec tailscale-pihole tailscale status --json 2>/dev/null | jq -r '.Self.ID // empty' || echo "")
   OAUTH_SERVE_STATUS=$(podman exec tailscale-pihole tailscale serve status 2>&1 || true)
 
+  echo "  [INFO] Tailscale Node ID: ${OAUTH_DEVICE_ID:-Waiting for ID}"
   echo "  [INFO] Tailscale Node IP: ${OAUTH_TS_IP:-Waiting for IP}"
   echo "  [INFO] Tailscale FQDN: ${OAUTH_TS_FQDN:-Waiting for FQDN}"
 
@@ -612,11 +627,16 @@ if [[ -n "${OAUTH_CLIENT_SECRET}" ]]; then
 
   echo ""
   echo "==> [STAGE 5/6] Verification Complete for Phase 2."
-  confirm_action "Phase 2 (OAuth Client: ${OAUTH_CLIENT_ID:-Manual}, Tailnet IP: ${OAUTH_TS_IP:-N/A}) is verified and live. Ready to destroy container?"
+  confirm_action "Phase 2 (OAuth Client: ${OAUTH_CLIENT_ID:-Manual}, Node: ${OAUTH_DEVICE_ID:-N/A}, Tailnet IP: ${OAUTH_TS_IP:-N/A}) is verified and live. Ready to destroy container and purge device?"
 
   echo ""
   echo "==> [STAGE 6/6] Tearing down Phase 2 container stack..."
   "${DEPLOYER_SCRIPT}" --mode uninstall --dir "${TEST_DIR}/oauth"
+
+  if [[ -n "${OAUTH_DEVICE_ID}" ]]; then
+    curl -s -X DELETE "https://api.tailscale.com/api/v2/device/${OAUTH_DEVICE_ID}" \
+      -H "Authorization: Bearer ${TS_API_KEY}" >/dev/null 2>&1 || true
+  fi
 
   if [[ "${CREATED_OAUTH_BY_API}" == "true" && -n "${OAUTH_CLIENT_ID}" ]]; then
     DEL_RESP=$(curl -s -w "\n%{http_code}" -X DELETE "https://api.tailscale.com/api/v2/tailnet/${OAUTH_TAILNET_SLUG}/oauth-clients/${OAUTH_CLIENT_ID}" \

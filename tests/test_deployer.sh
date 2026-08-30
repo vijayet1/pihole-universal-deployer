@@ -112,12 +112,13 @@ fi
 # Test 18: Compose Log Rotation & Spec Modernization (Tailscale mode)
 "${SCRIPT}" --mode tailscale --dir "${TEST_DIR}/ts-compose-test" --tailscale-key "tskey-auth-12345" --dry-run
 ts_compose_content=$(cat "${TEST_DIR}/ts-compose-test/docker-compose.yml")
-assert_contains "${ts_compose_content}" 'max-size: "20m"' "Test 18: Tailscale compose includes log rotation limits"
+assert_contains "${ts_compose_content}" 'max-size: "20m"' "Test 18: Tailscale compose includes log rotation limits (max-size)"
+assert_contains "${ts_compose_content}" 'max-file: "3"' "Test 19: Tailscale compose includes log rotation limits (max-file)"
 if [[ "${ts_compose_content}" == *"version:"* ]]; then
-  echo "  [FAIL] Test 19: Tailscale compose file contains obsolete 'version:' directive"
+  echo "  [FAIL] Test 20: Tailscale compose file contains obsolete 'version:' directive"
   ((FAILED++)) || true
 else
-  echo "  [PASS] Test 19: Tailscale compose file omits obsolete 'version:' directive"
+  echo "  [PASS] Test 20: Tailscale compose file omits obsolete 'version:' directive"
   ((PASSED++)) || true
 fi
 

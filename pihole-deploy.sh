@@ -500,6 +500,10 @@ run_uninstall() {
     fi
     run_privileged systemctl restart systemd-resolved 2>/dev/null || true
 
+    if [[ -f "/etc/caddy/Caddyfile" ]] || [[ "${DRY_RUN}" == "true" ]]; then
+      run_privileged rm -f "/etc/caddy/Caddyfile"
+    fi
+
     if systemctl is-active --quiet caddy 2>/dev/null || [[ "${DRY_RUN}" == "true" ]]; then
       run_privileged systemctl stop caddy || true
       run_privileged systemctl disable caddy || true
@@ -571,6 +575,9 @@ run_healthcheck() {
   fi
 
   echo -e "\n${BOLD}Healthcheck Summary: ${GREEN}${passed} Passed${NC}, ${RED}${failed} Failed${NC}"
+  if (( failed > 0 )); then
+    return 1
+  fi
   return 0
 }
 
@@ -733,8 +740,11 @@ parse_args() {
         shift
         ;;
       --healthcheck)
-        run_healthcheck
-        exit 0
+        if run_healthcheck; then
+          exit 0
+        else
+          exit 1
+        fi
         ;;
       --dry-run)
         DRY_RUN="true"

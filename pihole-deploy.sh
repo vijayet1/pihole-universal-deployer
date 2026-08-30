@@ -129,12 +129,14 @@ configure_system_dns_and_ports() {
     sysctl_content+=$'\nnet.ipv6.ip_unprivileged_port_start=53'
   fi
 
+  local current_port_start
+  current_port_start=$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || echo "1024")
   local need_sysctl_update="false"
-  if [[ ! -f "${sysctl_conf}" ]]; then
+  if (( current_port_start > 53 )); then
     need_sysctl_update="true"
-  elif ! grep -q "net.ipv4.ip_unprivileged_port_start=53" "${sysctl_conf}"; then
+  elif [[ ! -f "${sysctl_conf}" ]] && ! grep -Ers "ip_unprivileged_port_start[[:space:]]*=[[:space:]]*53" /etc/sysctl.d/ /etc/sysctl.conf 2>/dev/null; then
     need_sysctl_update="true"
-  elif [[ -f /proc/sys/net/ipv6/ip_unprivileged_port_start ]] && ! grep -q "net.ipv6.ip_unprivileged_port_start=53" "${sysctl_conf}"; then
+  elif [[ -f "${sysctl_conf}" ]] && [[ -f /proc/sys/net/ipv6/ip_unprivileged_port_start ]] && ! grep -q "net.ipv6.ip_unprivileged_port_start=53" "${sysctl_conf}"; then
     need_sysctl_update="true"
   fi
 

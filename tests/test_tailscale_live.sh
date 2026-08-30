@@ -53,8 +53,8 @@ echo "==========================================================================
 echo " [TEST 1/2] Programmatic Ephemeral Auth Key Lifecycle & Verification"
 echo "================================================================================"
 echo "==> Minting Ephemeral Auth Key via Tailscale REST API..."
-KEY_RESP=$(curl -s -w "\n%{http_code}" -X POST "https://api.tailscale.com/v2/tailnet/-/keys" \
-  -u "${TS_API_KEY}:" \
+KEY_RESP=$(curl -s -w "\n%{http_code}" -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
+  -H "Authorization: Bearer ${TS_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "capabilities": {
@@ -62,8 +62,7 @@ KEY_RESP=$(curl -s -w "\n%{http_code}" -X POST "https://api.tailscale.com/v2/tai
         "create": {
           "reusable": false,
           "ephemeral": true,
-          "preauthorized": true,
-          "tags": ["tag:pihole"]
+          "preauthorized": true
         }
       }
     }
@@ -96,7 +95,8 @@ echo "==> Tearing down Auth Key deployment..."
 "${DEPLOYER_SCRIPT}" --mode uninstall --dir "${TEST_DIR}/auth"
 
 echo "==> Deleting Auth Key from Tailscale API..."
-curl -s -X DELETE "https://api.tailscale.com/v2/tailnet/-/keys/${KEY_ID}" -u "${TS_API_KEY}:" >/dev/null
+curl -s -X DELETE "https://api.tailscale.com/api/v2/tailnet/-/keys/${KEY_ID}" \
+  -H "Authorization: Bearer ${TS_API_KEY}" >/dev/null
 echo "  [✓] Auth Key ${KEY_ID} revoked and deleted."
 
 # ------------------------------------------------------------------------------
@@ -107,8 +107,8 @@ echo "==========================================================================
 echo " [TEST 2/2] Programmatic OAuth Client Credentials Lifecycle & Auto-Tagging"
 echo "================================================================================"
 echo "==> Minting OAuth Client via Tailscale REST API..."
-OAUTH_RESP=$(curl -s -w "\n%{http_code}" -X POST "https://api.tailscale.com/v2/tailnet/-/oauth-clients" \
-  -u "${TS_API_KEY}:" \
+OAUTH_RESP=$(curl -s -w "\n%{http_code}" -X POST "https://api.tailscale.com/api/v2/tailnet/-/oauth-clients" \
+  -H "Authorization: Bearer ${TS_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "pihole-automated-test-client",
@@ -144,7 +144,8 @@ echo "==> Tearing down OAuth deployment..."
 "${DEPLOYER_SCRIPT}" --mode uninstall --dir "${TEST_DIR}/oauth"
 
 echo "==> Deleting OAuth Client from Tailscale API..."
-curl -s -X DELETE "https://api.tailscale.com/v2/tailnet/-/oauth-clients/${OAUTH_ID}" -u "${TS_API_KEY}:" >/dev/null
+curl -s -X DELETE "https://api.tailscale.com/api/v2/tailnet/-/oauth-clients/${OAUTH_ID}" \
+  -H "Authorization: Bearer ${TS_API_KEY}" >/dev/null
 echo "  [✓] OAuth Client ${OAUTH_ID} permanently deleted."
 
 echo ""

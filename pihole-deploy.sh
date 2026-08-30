@@ -81,7 +81,9 @@ detect_environment() {
   COMPOSE_CMD=""
   if command -v podman &>/dev/null; then
     CONTAINER_ENGINE="podman"
-    if command -v podman-compose &>/dev/null; then
+    if podman compose version &>/dev/null; then
+      COMPOSE_CMD="podman compose"
+    elif command -v podman-compose &>/dev/null; then
       COMPOSE_CMD="podman-compose"
     elif command -v uvx &>/dev/null; then
       COMPOSE_CMD="uvx podman-compose"
@@ -275,7 +277,9 @@ EOF
 
   # 3. Launch Stack
   log_info "Starting container stack via ${COMPOSE_CMD}..."
-  ${CONTAINER_ENGINE} rm -f pihole 2>/dev/null || true
+  if [[ -n "${CONTAINER_ENGINE}" ]]; then
+    "${CONTAINER_ENGINE}" rm -f pihole 2>/dev/null || true
+  fi
   (cd "${TARGET_DIR}" && ${COMPOSE_CMD} up -d)
 
   # 4. Configure Systemd User Service & Linger for Boot Autostart
@@ -389,7 +393,9 @@ EOF
 
   # 4. Clean previous instances and launch
   log_info "Launching Tailscale + Pi-hole pod..."
-  ${CONTAINER_ENGINE} rm -f pihole tailscale-pihole 2>/dev/null || true
+  if [[ -n "${CONTAINER_ENGINE}" ]]; then
+    "${CONTAINER_ENGINE}" rm -f pihole tailscale-pihole 2>/dev/null || true
+  fi
   (cd "${TARGET_DIR}" && ${COMPOSE_CMD} up -d)
 
   log_success "Tailscale Pi-hole Pod is starting!"
@@ -515,6 +521,7 @@ run_interactive_wizard() {
       DEPLOY_MODE="container"
       read -rp "Target Directory [${TARGET_DIR}]: " input_dir
       TARGET_DIR="${input_dir:-$TARGET_DIR}"
+      TARGET_DIR="${TARGET_DIR/#\~/$HOME}"
       read -rp "Web UI Host Port [${HTTP_PORT}]: " input_port
       HTTP_PORT="${input_port:-$HTTP_PORT}"
       ;;
@@ -522,6 +529,7 @@ run_interactive_wizard() {
       DEPLOY_MODE="tailscale"
       read -rp "Target Directory [${TARGET_DIR}]: " input_dir
       TARGET_DIR="${input_dir:-$TARGET_DIR}"
+      TARGET_DIR="${TARGET_DIR/#\~/$HOME}"
       read -rp "Enter Tailscale Auth Key or OAuth Secret (tskey-...): " TAILSCALE_KEY
       if [[ "${TAILSCALE_KEY}" == tskey-client-* ]]; then
         read -rp "OAuth Tag [${TAILSCALE_TAG}]: " input_tag
@@ -540,7 +548,7 @@ run_interactive_wizard() {
   if [[ "${DEPLOY_MODE}" != "uninstall" ]]; then
     read -rsp "Set Pi-hole Admin Password [default: AdminPass123!]: " input_pass
     echo ""
-    ADMIN_PASSWORD="${input_pass:-AdminPass123!}}"
+    ADMIN_PASSWORD="${input_pass:-}"
   fi
 }
 
@@ -593,6 +601,7 @@ parse_args() {
         ;;
       --dir)
         TARGET_DIR="$2"
+        TARGET_DIR="${TARGET_DIR/#\~/$HOME}"
         shift 2
         ;;
       --password)

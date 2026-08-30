@@ -55,6 +55,10 @@ assert_contains "${out}" "Detected Tailscale OAuth Client Secret" "Test 5: Dry-r
 out=$("${SCRIPT}" --healthcheck)
 assert_contains "${out}" "Healthcheck Summary" "Test 6: Healthcheck execution succeeds"
 
+# Test 7: Target Directory Tilde Expansion
+out=$("${SCRIPT}" --mode container --dir "~/test-pihole-$$" --dry-run)
+assert_contains "${out}" "${HOME}/test-pihole-$$" "Test 7: Tilde path expands to user home directory"
+
 echo ""
 echo "Test Results: ${PASSED} Passed, ${FAILED} Failed"
 if (( FAILED > 0 )); then

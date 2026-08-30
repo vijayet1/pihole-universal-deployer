@@ -39,6 +39,7 @@ TAILSCALE_KEY=""
 TAILSCALE_TAG="tag:pihole"
 HTTP_PORT="8080"
 ENABLE_SYSTEMD="true"
+PURGE_SYSTEM="false"
 DRY_RUN="false"
 
 # --- Helper: Privilege Escalation ---
@@ -57,6 +58,15 @@ run_privileged() {
   else
     log_error "Root privileges required, but neither sudo nor pkexec was found."
     exit 1
+  fi
+}
+
+# --- Helper: Secure Password Generation ---
+generate_secure_password() {
+  if command -v openssl &>/dev/null; then
+    openssl rand -hex 16
+  else
+    LC_ALL=C tr -dc 'A-Za-z0-9!#%_+=' < /dev/urandom | (head -c 32; true)
   fi
 }
 
@@ -81,7 +91,9 @@ detect_environment() {
   COMPOSE_CMD=""
   if command -v podman &>/dev/null; then
     CONTAINER_ENGINE="podman"
-    if command -v podman-compose &>/dev/null; then
+    if podman compose version &>/dev/null; then
+      COMPOSE_CMD="podman compose"
+    elif command -v podman-compose &>/dev/null; then
       COMPOSE_CMD="podman-compose"
     elif command -v uvx &>/dev/null; then
       COMPOSE_CMD="uvx podman-compose"
@@ -112,9 +124,25 @@ configure_system_dns_and_ports() {
 
   # 1. Allow rootless unprivileged ports >= 53
   local sysctl_conf="/etc/sysctl.d/50-pihole-unprivileged-ports.conf"
-  if [[ ! -f "${sysctl_conf}" ]] || ! grep "net.ipv4.ip_unprivileged_port_start=53" "${sysctl_conf}" >/dev/null 2>&1; then
+  local sysctl_content="net.ipv4.ip_unprivileged_port_start=53"
+  if [[ -f /proc/sys/net/ipv6/ip_unprivileged_port_start ]]; then
+    sysctl_content+=$'\nnet.ipv6.ip_unprivileged_port_start=53'
+  fi
+
+  local current_port_start
+  current_port_start=$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || echo "1024")
+  local need_sysctl_update="false"
+  if (( current_port_start > 53 )); then
+    need_sysctl_update="true"
+  elif [[ ! -f "${sysctl_conf}" ]] && ! grep -q -r -s -E "ip_unprivileged_port_start[[:space:]]*=[[:space:]]*53" /etc/sysctl.d/ /etc/sysctl.conf 2>/dev/null; then
+    need_sysctl_update="true"
+  elif [[ -f "${sysctl_conf}" ]] && [[ -f /proc/sys/net/ipv6/ip_unprivileged_port_start ]] && ! grep -q "net.ipv6.ip_unprivileged_port_start=53" "${sysctl_conf}"; then
+    need_sysctl_update="true"
+  fi
+
+  if [[ "${need_sysctl_update}" == "true" ]]; then
     log_info "Enabling unprivileged port 53 in sysctl..."
-    echo "net.ipv4.ip_unprivileged_port_start=53" | run_privileged tee "${sysctl_conf}" >/dev/null
+    printf "%s\n" "${sysctl_content}" | run_privileged tee "${sysctl_conf}" >/dev/null
     run_privileged sysctl --system >/dev/null
     log_success "Kernel unprivileged port threshold lowered to 53."
   else
@@ -125,24 +153,29 @@ configure_system_dns_and_ports() {
   if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
     log_info "systemd-resolved is active. Checking for port 53 stub conflicts..."
     local resolved_dir="/etc/systemd/resolved.conf.d"
-    run_privileged mkdir -p "${resolved_dir}"
-
-    # Create no-stub override
     local stub_conf="${resolved_dir}/no-stub.conf"
+    local docker_stub="${resolved_dir}/20-docker-dns.conf"
+    local need_resolved_restart="false"
+
+    # Create no-stub override if missing
     if [[ ! -f "${stub_conf}" ]]; then
       log_info "Disabling systemd-resolved DNSStubListener..."
+      run_privileged mkdir -p "${resolved_dir}"
       printf "[Resolve]\nDNSStubListener=no\n" | run_privileged tee "${stub_conf}" >/dev/null
+      need_resolved_restart="true"
     fi
 
     # Disable conflicting Docker extra stubs (e.g. 20-docker-dns.conf)
-    local docker_stub="${resolved_dir}/20-docker-dns.conf"
     if [[ -f "${docker_stub}" ]]; then
       log_warn "Found conflicting Docker stub listener (${docker_stub}). Disabling it..."
       run_privileged mv "${docker_stub}" "${docker_stub}.disabled"
+      need_resolved_restart="true"
     fi
 
-    log_info "Restarting systemd-resolved..."
-    run_privileged systemctl restart systemd-resolved || true
+    if [[ "${need_resolved_restart}" == "true" ]]; then
+      log_info "Restarting systemd-resolved..."
+      run_privileged systemctl restart systemd-resolved || true
+    fi
     log_success "systemd-resolved configured without port 53 conflict."
   fi
 
@@ -228,13 +261,22 @@ deploy_container() {
 
   mkdir -p "${TARGET_DIR}/etc-pihole" "${TARGET_DIR}/etc-dnsmasq.d"
 
+  if [[ -z "${ADMIN_PASSWORD}" ]]; then
+    ADMIN_PASSWORD=$(generate_secure_password)
+    log_info "Auto-generated secure Pi-hole admin password: ${ADMIN_PASSWORD}"
+  fi
+
   # 1. Create .env
   local env_file="${TARGET_DIR}/.env"
   log_info "Creating environment file: ${env_file}"
+  (umask 077 && touch "${env_file}")
+  chmod 600 "${env_file}"
   cat <<EOF > "${env_file}"
 TZ=${TIMEZONE}
-WEBPASSWORD=${ADMIN_PASSWORD:-AdminPass123!}
+WEBPASSWORD=${ADMIN_PASSWORD}
+FTLCONF_webserver_api_password=${ADMIN_PASSWORD}
 FTLCONF_dns_listeningMode=all
+FTLCONF_dns_upstreams=1.1.1.1;8.8.8.8
 PIHOLE_DNS_1=1.1.1.1
 PIHOLE_DNS_2=8.8.8.8
 EOF
@@ -243,12 +285,11 @@ EOF
   local compose_file="${TARGET_DIR}/docker-compose.yml"
   log_info "Writing ${compose_file}..."
   cat <<EOF > "${compose_file}"
-version: "3"
-
 services:
   pihole:
     container_name: pihole
     image: docker.io/pihole/pihole:latest
+    network_mode: "bridge"
     restart: unless-stopped
     dns:
       - 1.1.1.1
@@ -260,12 +301,19 @@ services:
     environment:
       - TZ=\${TZ}
       - WEBPASSWORD=\${WEBPASSWORD}
+      - FTLCONF_webserver_api_password=\${FTLCONF_webserver_api_password}
       - FTLCONF_dns_listeningMode=\${FTLCONF_dns_listeningMode}
+      - FTLCONF_dns_upstreams=\${FTLCONF_dns_upstreams}
       - PIHOLE_DNS_1=\${PIHOLE_DNS_1}
       - PIHOLE_DNS_2=\${PIHOLE_DNS_2}
     volumes:
       - ./etc-pihole:/etc/pihole:Z
       - ./etc-dnsmasq.d:/etc/dnsmasq.d:Z
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
 EOF
 
   if [[ "${DRY_RUN}" == "true" ]]; then
@@ -275,13 +323,17 @@ EOF
 
   # 3. Launch Stack
   log_info "Starting container stack via ${COMPOSE_CMD}..."
-  ${CONTAINER_ENGINE} rm -f pihole 2>/dev/null || true
+  if [[ -n "${CONTAINER_ENGINE}" ]]; then
+    "${CONTAINER_ENGINE}" rm -f pihole 2>/dev/null || true
+  fi
   (cd "${TARGET_DIR}" && ${COMPOSE_CMD} up -d)
 
   # 4. Configure Systemd User Service & Linger for Boot Autostart
   if [[ "${CONTAINER_ENGINE}" == "podman" && "${ENABLE_SYSTEMD}" == "true" ]]; then
-    log_info "Enabling systemd linger for user ${USER}..."
-    run_privileged loginctl enable-linger "${USER}" 2>/dev/null || true
+    if [[ "$(loginctl show-user "${USER}" --property=Linger 2>/dev/null)" != "Linger=yes" ]]; then
+      log_info "Enabling systemd linger for user ${USER}..."
+      loginctl enable-linger "${USER}" 2>/dev/null || run_privileged loginctl enable-linger "${USER}" 2>/dev/null || true
+    fi
   fi
 
   log_success "Pi-hole container deployed successfully!"
@@ -294,7 +346,16 @@ EOF
 deploy_tailscale_sidecar() {
   log_step "Deploying Topology 3: Tailscale Sidecar + Pi-hole with Automated TLS"
 
+  if [[ ! -c /dev/net/tun ]]; then
+    log_warn "/dev/net/tun not found or inaccessible. Tailscale will require userspace networking."
+  fi
+
   mkdir -p "${TARGET_DIR}/etc-pihole" "${TARGET_DIR}/etc-dnsmasq.d" "${TARGET_DIR}/tailscale-state"
+
+  if [[ -z "${ADMIN_PASSWORD}" ]]; then
+    ADMIN_PASSWORD=$(generate_secure_password)
+    log_info "Auto-generated secure Pi-hole admin password: ${ADMIN_PASSWORD}"
+  fi
 
   # Detect OAuth vs Auth Key
   local extra_args=""
@@ -306,15 +367,21 @@ deploy_tailscale_sidecar() {
   # 1. Create .env
   local env_file="${TARGET_DIR}/.env"
   log_info "Writing ${env_file}..."
+  (umask 077 && touch "${env_file}")
+  chmod 600 "${env_file}"
   cat <<EOF > "${env_file}"
 TS_AUTHKEY=${TAILSCALE_KEY}
 TZ=${TIMEZONE}
-WEBPASSWORD=${ADMIN_PASSWORD:-AdminPass123!}
+WEBPASSWORD=${ADMIN_PASSWORD}
+FTLCONF_webserver_api_password=${ADMIN_PASSWORD}
+FTLCONF_dns_upstreams=1.1.1.1;8.8.8.8
 EOF
 
   # 2. Create serve.json for Tailscale Serve (HTTPS 443 -> HTTP 80)
   local serve_file="${TARGET_DIR}/serve.json"
   log_info "Writing Tailscale Serve declarative config to ${serve_file}..."
+  (umask 077 && touch "${serve_file}")
+  chmod 600 "${serve_file}"
   cat <<'EOF' > "${serve_file}"
 {
   "TCP": {
@@ -338,8 +405,6 @@ EOF
   local compose_file="${TARGET_DIR}/docker-compose.yml"
   log_info "Writing sidecar ${compose_file}..."
   cat <<EOF > "${compose_file}"
-version: "3"
-
 services:
   tailscale:
     container_name: tailscale-pihole
@@ -362,6 +427,11 @@ $( [[ -n "${extra_args}" ]] && echo "      - TS_EXTRA_ARGS=${extra_args}" )
       - NET_ADMIN
       - NET_RAW
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
 
   pihole:
     container_name: pihole
@@ -373,13 +443,20 @@ $( [[ -n "${extra_args}" ]] && echo "      - TS_EXTRA_ARGS=${extra_args}" )
     environment:
       - TZ=\${TZ}
       - WEBPASSWORD=\${WEBPASSWORD}
+      - FTLCONF_webserver_api_password=\${FTLCONF_webserver_api_password}
       - FTLCONF_dns_listeningMode=all
+      - FTLCONF_dns_upstreams=\${FTLCONF_dns_upstreams}
       - FTLCONF_webserver_port=80
       - PIHOLE_DNS_1=1.1.1.1
       - PIHOLE_DNS_2=8.8.8.8
     volumes:
       - ./etc-pihole:/etc/pihole:Z
       - ./etc-dnsmasq.d:/etc/dnsmasq.d:Z
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
 EOF
 
   if [[ "${DRY_RUN}" == "true" ]]; then
@@ -389,7 +466,9 @@ EOF
 
   # 4. Clean previous instances and launch
   log_info "Launching Tailscale + Pi-hole pod..."
-  ${CONTAINER_ENGINE} rm -f pihole tailscale-pihole 2>/dev/null || true
+  if [[ -n "${CONTAINER_ENGINE}" ]]; then
+    "${CONTAINER_ENGINE}" rm -f pihole tailscale-pihole 2>/dev/null || true
+  fi
   (cd "${TARGET_DIR}" && ${COMPOSE_CMD} up -d)
 
   log_success "Tailscale Pi-hole Pod is starting!"
@@ -405,23 +484,71 @@ run_uninstall() {
   log_step "Uninstalling and Removing Pi-hole Stack"
 
   # 1. Stop Containers if running
-  if command -v podman &>/dev/null; then
-    podman rm -f pihole tailscale-pihole 2>/dev/null || true
-  fi
-  if command -v docker &>/dev/null; then
-    docker rm -f pihole tailscale-pihole 2>/dev/null || true
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    log_info "[DRY-RUN] Would remove containers if running."
+  else
+    # Trigger tailscale logout to immediately deregister ephemeral nodes from control plane
+    if command -v podman &>/dev/null && podman ps --filter name=tailscale-pihole --format "{{.ID}}" 2>/dev/null | grep -q .; then
+      log_info "Logging out Tailscale node to trigger instant ephemeral deregistration..."
+      podman exec tailscale-pihole tailscale logout 2>/dev/null || true
+    elif command -v docker &>/dev/null && docker ps --filter name=tailscale-pihole --format "{{.ID}}" 2>/dev/null | grep -q .; then
+      log_info "Logging out Tailscale node to trigger instant ephemeral deregistration..."
+      docker exec tailscale-pihole tailscale logout 2>/dev/null || true
+    fi
+
+    if [[ -n "${CONTAINER_ENGINE}" ]]; then
+      "${CONTAINER_ENGINE}" rm -f pihole tailscale-pihole 2>/dev/null || true
+    else
+      if command -v podman &>/dev/null; then
+        podman rm -f pihole tailscale-pihole 2>/dev/null || true
+      elif command -v docker &>/dev/null; then
+        docker rm -f pihole tailscale-pihole 2>/dev/null || true
+      fi
+    fi
   fi
 
   # 2. Standalone Pi-hole removal if installed
   if command -v pihole &>/dev/null; then
-    log_info "Found host Pi-hole binary. Calling pihole uninstall..."
+    log_info "Calling host pihole uninstall..."
     run_privileged pihole uninstall || true
   fi
 
-  # 3. Clean files if user confirms
-  if [[ -d "${TARGET_DIR}" ]]; then
+  # 3. System Rollback & Purge
+  if [[ "${PURGE_SYSTEM}" == "true" ]]; then
+    log_step "Restoring system DNS and sysctl settings..."
+    local sysctl_conf="/etc/sysctl.d/50-pihole-unprivileged-ports.conf"
+    if [[ -f "${sysctl_conf}" ]] || [[ "${DRY_RUN}" == "true" ]]; then
+      run_privileged rm -f "${sysctl_conf}"
+      run_privileged sysctl --system >/dev/null 2>&1 || true
+    fi
+
+    local resolved_dir="/etc/systemd/resolved.conf.d"
+    run_privileged rm -f "${resolved_dir}/no-stub.conf"
+    if [[ -f "${resolved_dir}/20-docker-dns.conf.disabled" ]] || [[ "${DRY_RUN}" == "true" ]]; then
+      run_privileged mv "${resolved_dir}/20-docker-dns.conf.disabled" "${resolved_dir}/20-docker-dns.conf"
+    fi
+    run_privileged systemctl restart systemd-resolved 2>/dev/null || true
+
+    if [[ -f "/etc/caddy/Caddyfile" ]] || [[ "${DRY_RUN}" == "true" ]]; then
+      run_privileged rm -f "/etc/caddy/Caddyfile"
+    fi
+
+    if systemctl is-active --quiet caddy 2>/dev/null || [[ "${DRY_RUN}" == "true" ]]; then
+      run_privileged systemctl stop caddy || true
+      run_privileged systemctl disable caddy || true
+    fi
+  fi
+
+  # 4. Clean deployment directory
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    log_info "[DRY-RUN] Would remove deployment directory: ${TARGET_DIR}"
+  elif [[ -d "${TARGET_DIR}" ]]; then
     log_warn "Removing deployment directory: ${TARGET_DIR}"
-    rm -rf "${TARGET_DIR}"
+    if command -v podman &>/dev/null; then
+      podman unshare rm -rf "${TARGET_DIR}" 2>/dev/null || rm -rf "${TARGET_DIR}" 2>/dev/null || run_privileged rm -rf "${TARGET_DIR}" || true
+    else
+      rm -rf "${TARGET_DIR}" 2>/dev/null || run_privileged rm -rf "${TARGET_DIR}" || true
+    fi
   fi
 
   log_success "Pi-hole deployment has been uninstalled."
@@ -447,6 +574,10 @@ run_healthcheck() {
   elif command -v docker &>/dev/null && docker ps --filter name=pihole --format "{{.Status}}" 2>/dev/null | grep -i "up" >/dev/null 2>&1; then
     log_success "[PASS] Pi-hole container is UP and running."
     ((passed++)) || true
+    if docker exec pihole pihole status 2>/dev/null | grep -i "listening" >/dev/null 2>&1; then
+      log_success "[PASS] pihole-FTL DNS engine is active and listening."
+      ((passed++)) || true
+    fi
   elif command -v pihole &>/dev/null; then
     log_success "[PASS] Host Pi-hole binary is installed."
     ((passed++)) || true
@@ -472,7 +603,18 @@ run_healthcheck() {
   fi
 
   # Check Web Admin Response
+  local web_responding="false"
   if curl -sI http://127.0.0.1:8080/admin/ >/dev/null 2>&1 || curl -sI http://127.0.0.1/admin/ >/dev/null 2>&1 || curl -k -sI https://127.0.0.1/admin/ >/dev/null 2>&1; then
+    web_responding="true"
+  elif [[ -n "${ts_ip:-}" ]] && (curl -k -sI --max-time 3 "https://${ts_ip}/admin/" >/dev/null 2>&1 || curl -sI --max-time 3 "http://${ts_ip}/admin/" >/dev/null 2>&1); then
+    web_responding="true"
+  elif command -v podman &>/dev/null && podman exec pihole curl -sI http://127.0.0.1:80/admin/ >/dev/null 2>&1; then
+    web_responding="true"
+  elif command -v docker &>/dev/null && docker exec pihole curl -sI http://127.0.0.1:80/admin/ >/dev/null 2>&1; then
+    web_responding="true"
+  fi
+
+  if [[ "${web_responding}" == "true" ]]; then
     log_success "[PASS] Web Admin dashboard is responding."
     ((passed++)) || true
   else
@@ -481,6 +623,9 @@ run_healthcheck() {
   fi
 
   echo -e "\n${BOLD}Healthcheck Summary: ${GREEN}${passed} Passed${NC}, ${RED}${failed} Failed${NC}"
+  if (( failed > 0 )); then
+    return 1
+  fi
   return 0
 }
 
@@ -515,6 +660,7 @@ run_interactive_wizard() {
       DEPLOY_MODE="container"
       read -rp "Target Directory [${TARGET_DIR}]: " input_dir
       TARGET_DIR="${input_dir:-$TARGET_DIR}"
+      TARGET_DIR="${TARGET_DIR/#\~/$HOME}"
       read -rp "Web UI Host Port [${HTTP_PORT}]: " input_port
       HTTP_PORT="${input_port:-$HTTP_PORT}"
       ;;
@@ -522,6 +668,7 @@ run_interactive_wizard() {
       DEPLOY_MODE="tailscale"
       read -rp "Target Directory [${TARGET_DIR}]: " input_dir
       TARGET_DIR="${input_dir:-$TARGET_DIR}"
+      TARGET_DIR="${TARGET_DIR/#\~/$HOME}"
       read -rp "Enter Tailscale Auth Key or OAuth Secret (tskey-...): " TAILSCALE_KEY
       if [[ "${TAILSCALE_KEY}" == tskey-client-* ]]; then
         read -rp "OAuth Tag [${TAILSCALE_TAG}]: " input_tag
@@ -530,6 +677,13 @@ run_interactive_wizard() {
       ;;
     4)
       DEPLOY_MODE="uninstall"
+      read -rp "Target Directory to remove [${TARGET_DIR}]: " input_dir
+      TARGET_DIR="${input_dir:-$TARGET_DIR}"
+      TARGET_DIR="${TARGET_DIR/#\~/$HOME}"
+      read -rp "Purge system DNS, sysctl settings, and stop Caddy? (y/N): " purge_choice
+      if [[ "${purge_choice}" =~ ^[Yy]$ ]]; then
+        PURGE_SYSTEM="true"
+      fi
       ;;
     *)
       log_error "Invalid selection. Exiting."
@@ -538,9 +692,9 @@ run_interactive_wizard() {
   esac
 
   if [[ "${DEPLOY_MODE}" != "uninstall" ]]; then
-    read -rsp "Set Pi-hole Admin Password [default: AdminPass123!]: " input_pass
+    read -rsp "Set Pi-hole Admin Password [leave blank to auto-generate]: " input_pass
     echo ""
-    ADMIN_PASSWORD="${input_pass:-AdminPass123!}}"
+    ADMIN_PASSWORD="${input_pass:-}"
   fi
 }
 
@@ -560,11 +714,13 @@ Topologies:
 Options:
   --dir <path>             Target installation directory (default: ~/pihole)
   --password <password>    Pi-hole Admin Web UI password
+  --password-stdin         Read Pi-hole password from standard input
   --domain <fqdn>          Domain for Let's Encrypt HTTPS (Standalone mode)
   --tailscale-key <key>    Tailscale Auth Key (tskey-auth-...) or OAuth Secret (tskey-client-...)
   --tailscale-tag <tag>    Tag for OAuth key (default: tag:pihole)
   --port <port>            Host port for Web UI in container mode (default: 8080)
   --timezone <tz>          Timezone string (e.g. Europe/Berlin, UTC)
+  --purge-system           Rollback system DNS, sysctl configs, and Caddy on uninstall
   --healthcheck            Run diagnostics on existing installation
   --dry-run                Show deployment plan without executing commands
   -h, --help               Show this help message
@@ -585,6 +741,9 @@ EOF
 }
 
 parse_args() {
+  ADMIN_PASSWORD="${PIHOLE_PASSWORD:-${ADMIN_PASSWORD}}"
+  TAILSCALE_KEY="${TS_AUTHKEY:-${TAILSCALE_KEY:-${TAILSCALE_AUTHKEY:-}}}"
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --mode)
@@ -593,11 +752,16 @@ parse_args() {
         ;;
       --dir)
         TARGET_DIR="$2"
+        TARGET_DIR="${TARGET_DIR/#\~/$HOME}"
         shift 2
         ;;
       --password)
         ADMIN_PASSWORD="$2"
         shift 2
+        ;;
+      --password-stdin)
+        IFS= read -r ADMIN_PASSWORD || [[ -n "${ADMIN_PASSWORD}" ]]
+        shift
         ;;
       --domain)
         CUSTOM_DOMAIN="$2"
@@ -619,9 +783,16 @@ parse_args() {
         TIMEZONE="$2"
         shift 2
         ;;
+      --purge-system)
+        PURGE_SYSTEM="true"
+        shift
+        ;;
       --healthcheck)
-        run_healthcheck
-        exit 0
+        if run_healthcheck; then
+          exit 0
+        else
+          exit 1
+        fi
         ;;
       --dry-run)
         DRY_RUN="true"

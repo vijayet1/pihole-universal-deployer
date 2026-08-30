@@ -79,6 +79,7 @@ AUTH_REVOKE_STATUS="SKIPPED"
 OAUTH_CLIENT_ID=""
 OAUTH_CLIENT_SECRET=""
 OAUTH_TAG_USED="tag:pihole"
+OAUTH_TAILNET_SLUG="-"
 OAUTH_TS_IP=""
 OAUTH_TS_FQDN=""
 OAUTH_SERVE_STATUS=""
@@ -467,6 +468,11 @@ CREATED_OAUTH_BY_API="false"
 if [[ -z "${OAUTH_CLIENT_SECRET}" && -n "${TS_API_KEY}" ]]; then
   echo "==> [STAGE 1/6] Inspecting Tailnet ACL and Minting OAuth Client via Tailscale REST API..."
   
+  # Discover candidate tailnet slugs
+  TN_NAME=$(tailscale status --json 2>/dev/null | jq -r '.CurrentTailnet.Name // empty' 2>/dev/null || true)
+  TN_MAGIC=$(tailscale status --json 2>/dev/null | jq -r '.MagicDNSSuffix // empty' 2>/dev/null || true)
+  TN_USER=$(tailscale status --json 2>/dev/null | jq -r '.User[].LoginName // empty' 2>/dev/null || true)
+
   # Discover or configure ACL tags
   CHOSEN_TAG="tag:pihole"
   ACL_RESP=$(curl -s -H "Authorization: Bearer ${TS_API_KEY}" "https://api.tailscale.com/api/v2/tailnet/-/acl" 2>/dev/null || true)
@@ -499,26 +505,36 @@ if [[ -z "${OAUTH_CLIENT_SECRET}" && -n "${TS_API_KEY}" ]]; then
     --arg tag "${OAUTH_TAG_USED}" \
     '{name: $name, description: $desc, scopes: ["devices:core"], tags: [$tag]}')
 
-  OAUTH_RESP=$(curl -s -w "\n%{http_code}" -X POST "https://api.tailscale.com/api/v2/tailnet/-/oauth-clients" \
-    -H "Authorization: Bearer ${TS_API_KEY}" \
-    -H "Content-Type: application/json" \
-    -d "${OAUTH_PAYLOAD}")
+  # Iterate over candidate tailnet slugs to avoid 404 router errors
+  MINT_SUCCESS="false"
+  for slug in "${TN_NAME}" "${TN_MAGIC}" "${TN_USER}" "-"; do
+    [[ -z "${slug}" ]] && continue
+    OAUTH_RESP=$(curl -s -w "\n%{http_code}" -X POST "https://api.tailscale.com/api/v2/tailnet/${slug}/oauth-clients" \
+      -H "Authorization: Bearer ${TS_API_KEY}" \
+      -H "Content-Type: application/json" \
+      -d "${OAUTH_PAYLOAD}")
 
-  HTTP_CODE=$(echo "${OAUTH_RESP}" | tail -n 1)
-  BODY=$(echo "${OAUTH_RESP}" | sed '$d')
+    HTTP_CODE=$(echo "${OAUTH_RESP}" | tail -n 1)
+    BODY=$(echo "${OAUTH_RESP}" | sed '$d')
 
-  if [[ "${HTTP_CODE}" -ne 200 && "${HTTP_CODE}" -ne 201 ]]; then
+    if [[ "${HTTP_CODE}" -eq 200 || "${HTTP_CODE}" -eq 201 ]]; then
+      OAUTH_CLIENT_SECRET=$(echo "${BODY}" | jq -r '.secret // empty')
+      OAUTH_CLIENT_ID=$(echo "${BODY}" | jq -r '.id // empty')
+      CREATED_OAUTH_BY_API="true"
+      OAUTH_TAILNET_SLUG="${slug}"
+      MINT_SUCCESS="true"
+      echo "  [✓] OAuth Client Created via tailnet slug '${slug}': ID=${OAUTH_CLIENT_ID}"
+      echo "  [✓] Assigned ACL Tag: ${OAUTH_TAG_USED}"
+      echo "  [✓] OAuth Secret Prefix: ${OAUTH_CLIENT_SECRET:0:18}..."
+      break
+    fi
+  done
+
+  if [[ "${MINT_SUCCESS}" != "true" ]]; then
     echo "⚠️  Note: Dynamic OAuth Client creation returned HTTP ${HTTP_CODE}: ${BODY}"
-    echo "    (Dynamic OAuth minting requires 'tagOwners' with '${OAUTH_TAG_USED}' in your Tailscale ACL policy or an admin API key)"
+    echo "    (Dynamic OAuth minting requires an API token with OAuth write permissions)"
     echo "    You can also supply a pre-created OAuth key via: export TS_OAUTH_KEY=\"tskey-client-...\""
     OAUTH_STATUS="SKIPPED (ACL / Scope Requirement: ${BODY})"
-  else
-    OAUTH_CLIENT_SECRET=$(echo "${BODY}" | jq -r '.secret // empty')
-    OAUTH_CLIENT_ID=$(echo "${BODY}" | jq -r '.id // empty')
-    CREATED_OAUTH_BY_API="true"
-    echo "  [✓] OAuth Client Created: ID=${OAUTH_CLIENT_ID}"
-    echo "  [✓] Assigned ACL Tag: ${OAUTH_TAG_USED}"
-    echo "  [✓] OAuth Secret Prefix: ${OAUTH_CLIENT_SECRET:0:18}..."
   fi
 fi
 
@@ -603,7 +619,7 @@ if [[ -n "${OAUTH_CLIENT_SECRET}" ]]; then
   "${DEPLOYER_SCRIPT}" --mode uninstall --dir "${TEST_DIR}/oauth"
 
   if [[ "${CREATED_OAUTH_BY_API}" == "true" && -n "${OAUTH_CLIENT_ID}" ]]; then
-    DEL_RESP=$(curl -s -w "\n%{http_code}" -X DELETE "https://api.tailscale.com/api/v2/tailnet/-/oauth-clients/${OAUTH_CLIENT_ID}" \
+    DEL_RESP=$(curl -s -w "\n%{http_code}" -X DELETE "https://api.tailscale.com/api/v2/tailnet/${OAUTH_TAILNET_SLUG}/oauth-clients/${OAUTH_CLIENT_ID}" \
       -H "Authorization: Bearer ${TS_API_KEY}")
     DEL_CODE=$(echo "${DEL_RESP}" | tail -n 1)
     if [[ "${DEL_CODE}" -eq 200 || "${DEL_CODE}" -eq 204 ]]; then

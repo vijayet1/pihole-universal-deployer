@@ -48,12 +48,15 @@ graph TD
 
 ## ✨ Features & Idempotency Guarantees
 
-* **Automated Port 53 Resolution:** Fixes the common Linux issue where rootless containers cannot bind privileged ports `< 1024` by configuring `net.ipv4.ip_unprivileged_port_start=53`.
+* **Dual-Stack Port 53 Resolution:** Configures `net.ipv4.ip_unprivileged_port_start=53` (and `net.ipv6.ip_unprivileged_port_start=53` if IPv6 is supported), allowing rootless Podman / Docker to bind port 53.
 * **Systemd-Resolved Stub Isolation:** Automatically resolves port 53 binding conflicts with `systemd-resolved` by creating drop-in overrides (`DNSStubListener=no`).
+* **Hardened Secrets Management:** Enforces `0600` filesystem permissions (`umask 077`) on generated `.env` and `serve.json` credential artifacts. Supports secret injection via environment variables (`PIHOLE_PASSWORD`, `TS_AUTHKEY`) and `--password-stdin` to prevent process table credential leakage.
+* **Cryptographic Token Auto-Generation:** Replaces insecure default passwords with dynamic 32-character high-entropy token generation (`openssl rand -hex 16`).
 * **Pi-hole v6 HTTPS Conflict Avoidance:** In shared network pods (Tailscale sidecars), prevents Pi-hole's built-in self-signed TLS server from colliding with Tailscale Serve by setting `FTLCONF_webserver_port=80`.
 * **Tailscale OAuth & Reusable Auth Keys:** Auto-detects `tskey-client-*` vs `tskey-auth-*` keys and automatically configures `--advertise-tags`.
-* **Interactive TUI Wizard & CLI Flags:** Run interactively or automate via command-line arguments.
-* **Built-in Diagnostics & Testing:** Includes `--healthcheck` and a test suite.
+* **Bounded Container Log Rotation:** Enforces `json-file` log caps (`max-size: 20m`, `max-file: 3`) to prevent log volume exhaustion.
+* **Complete System Rollback:** The uninstaller supports `--purge-system` to cleanly revert sysctl rules, restore systemd-resolved stubs, and stop Caddy.
+* **Deterministic Healthchecks & Portable Test Suite:** `--healthcheck` returns strict exit codes (`0` on pass, `1` on fail) for CI/CD integration, with a 25-assertion test suite in `tests/test_deployer.sh`.
 
 ---
 

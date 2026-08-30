@@ -541,6 +541,10 @@ run_healthcheck() {
   elif command -v docker &>/dev/null && docker ps --filter name=pihole --format "{{.Status}}" 2>/dev/null | grep -i "up" >/dev/null 2>&1; then
     log_success "[PASS] Pi-hole container is UP and running."
     ((passed++)) || true
+    if docker exec pihole pihole status 2>/dev/null | grep -i "listening" >/dev/null 2>&1; then
+      log_success "[PASS] pihole-FTL DNS engine is active and listening."
+      ((passed++)) || true
+    fi
   elif command -v pihole &>/dev/null; then
     log_success "[PASS] Host Pi-hole binary is installed."
     ((passed++)) || true

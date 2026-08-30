@@ -123,9 +123,14 @@ configure_system_dns_and_ports() {
 
   # 1. Allow rootless unprivileged ports >= 53
   local sysctl_conf="/etc/sysctl.d/50-pihole-unprivileged-ports.conf"
+  local sysctl_content="net.ipv4.ip_unprivileged_port_start=53"
+  if [[ -f /proc/sys/net/ipv6/ip_unprivileged_port_start ]]; then
+    sysctl_content+=$'\nnet.ipv6.ip_unprivileged_port_start=53'
+  fi
+
   if [[ ! -f "${sysctl_conf}" ]] || ! grep "net.ipv4.ip_unprivileged_port_start=53" "${sysctl_conf}" >/dev/null 2>&1; then
     log_info "Enabling unprivileged port 53 in sysctl..."
-    echo "net.ipv4.ip_unprivileged_port_start=53" | run_privileged tee "${sysctl_conf}" >/dev/null
+    printf "%s\n" "${sysctl_content}" | run_privileged tee "${sysctl_conf}" >/dev/null
     run_privileged sysctl --system >/dev/null
     log_success "Kernel unprivileged port threshold lowered to 53."
   else
@@ -261,8 +266,6 @@ EOF
   local compose_file="${TARGET_DIR}/docker-compose.yml"
   log_info "Writing ${compose_file}..."
   cat <<EOF > "${compose_file}"
-version: "3"
-
 services:
   pihole:
     container_name: pihole
@@ -284,6 +287,11 @@ services:
     volumes:
       - ./etc-pihole:/etc/pihole:Z
       - ./etc-dnsmasq.d:/etc/dnsmasq.d:Z
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
 EOF
 
   if [[ "${DRY_RUN}" == "true" ]]; then
@@ -313,6 +321,10 @@ EOF
 # ==============================================================================
 deploy_tailscale_sidecar() {
   log_step "Deploying Topology 3: Tailscale Sidecar + Pi-hole with Automated TLS"
+
+  if [[ ! -c /dev/net/tun ]]; then
+    log_warn "/dev/net/tun not found or inaccessible. Tailscale will require userspace networking."
+  fi
 
   mkdir -p "${TARGET_DIR}/etc-pihole" "${TARGET_DIR}/etc-dnsmasq.d" "${TARGET_DIR}/tailscale-state"
 
@@ -367,8 +379,6 @@ EOF
   local compose_file="${TARGET_DIR}/docker-compose.yml"
   log_info "Writing sidecar ${compose_file}..."
   cat <<EOF > "${compose_file}"
-version: "3"
-
 services:
   tailscale:
     container_name: tailscale-pihole
@@ -391,6 +401,11 @@ $( [[ -n "${extra_args}" ]] && echo "      - TS_EXTRA_ARGS=${extra_args}" )
       - NET_ADMIN
       - NET_RAW
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
 
   pihole:
     container_name: pihole
@@ -409,6 +424,11 @@ $( [[ -n "${extra_args}" ]] && echo "      - TS_EXTRA_ARGS=${extra_args}" )
     volumes:
       - ./etc-pihole:/etc/pihole:Z
       - ./etc-dnsmasq.d:/etc/dnsmasq.d:Z
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
 EOF
 
   if [[ "${DRY_RUN}" == "true" ]]; then

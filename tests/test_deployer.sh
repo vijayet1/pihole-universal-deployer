@@ -96,6 +96,31 @@ printf "NoNewlinePass456!" | "${SCRIPT}" --mode container --dir "${TEST_DIR}/sec
 stdin_val2=$(grep "^WEBPASSWORD=" "${TEST_DIR}/sec-nonl/.env" | cut -d'=' -f2)
 assert_contains "${stdin_val2}" "NoNewlinePass456!" "Test 14: Ingests password from stdin without trailing newline"
 
+# Test 15: Compose Log Rotation & Spec Modernization (Container mode)
+"${SCRIPT}" --mode container --dir "${TEST_DIR}/compose-test" --dry-run
+compose_content=$(cat "${TEST_DIR}/compose-test/docker-compose.yml")
+assert_contains "${compose_content}" 'max-size: "20m"' "Test 15: Compose includes log rotation limits (max-size)"
+assert_contains "${compose_content}" 'max-file: "3"' "Test 16: Compose includes log rotation limits (max-file)"
+if [[ "${compose_content}" == *"version:"* ]]; then
+  echo "  [FAIL] Test 17: Container compose file contains obsolete 'version:' directive"
+  ((FAILED++)) || true
+else
+  echo "  [PASS] Test 17: Container compose file omits obsolete 'version:' directive"
+  ((PASSED++)) || true
+fi
+
+# Test 18: Compose Log Rotation & Spec Modernization (Tailscale mode)
+"${SCRIPT}" --mode tailscale --dir "${TEST_DIR}/ts-compose-test" --tailscale-key "tskey-auth-12345" --dry-run
+ts_compose_content=$(cat "${TEST_DIR}/ts-compose-test/docker-compose.yml")
+assert_contains "${ts_compose_content}" 'max-size: "20m"' "Test 18: Tailscale compose includes log rotation limits"
+if [[ "${ts_compose_content}" == *"version:"* ]]; then
+  echo "  [FAIL] Test 19: Tailscale compose file contains obsolete 'version:' directive"
+  ((FAILED++)) || true
+else
+  echo "  [PASS] Test 19: Tailscale compose file omits obsolete 'version:' directive"
+  ((PASSED++)) || true
+fi
+
 echo ""
 echo "Test Results: ${PASSED} Passed, ${FAILED} Failed"
 if (( FAILED > 0 )); then

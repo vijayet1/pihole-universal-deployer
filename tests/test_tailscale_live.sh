@@ -6,7 +6,7 @@
 # 2. Deploys Topology 3 (Tailscale Sidecar Pod) and captures all config artifacts
 # 3. Executes live network, DNS, and HTTPS probes against the running mesh pod
 # 4. Requests interactive confirmation before teardown and key revocation
-# 5. Programmatically creates an OAuth Client Secret (or accepts TS_OAUTH_KEY)
+# 5. Programmatically configures ACL tags & mints an OAuth Client Secret via API
 # 6. Deploys & verifies Topology 3 with OAuth client authentication
 # 7. Requests interactive confirmation before OAuth teardown and client deletion
 # 8. Generates comprehensive factual Markdown audit report in docs/reports/TAILSCALE_TEST_REPORT.md
@@ -78,6 +78,7 @@ AUTH_REVOKE_STATUS="SKIPPED"
 
 OAUTH_CLIENT_ID=""
 OAUTH_CLIENT_SECRET=""
+OAUTH_TAG_USED="tag:pihole"
 OAUTH_TS_IP=""
 OAUTH_TS_FQDN=""
 OAUTH_SERVE_STATUS=""
@@ -223,8 +224,8 @@ ${AUTH_LOGS_OUTPUT}
 ### 2. OAuth Client Credentials Lifecycle (\`tskey-client-...\`)
 
 - **Generated OAuth Client ID:** \`${OAUTH_CLIENT_ID:-N/A}\`
-- **Assigned Tag:** \`tag:pihole\`
-- **Auto-Injected Flag:** \`--advertise-tags=tag:pihole\`
+- **Assigned ACL Tag:** \`${OAUTH_TAG_USED}\`
+- **Auto-Injected Flag:** \`--advertise-tags=${OAUTH_TAG_USED}\`
 - **Allocated Tailnet IP:** \`${OAUTH_TS_IP:-N/A}\`
 - **Deletion Status:** \`${OAUTH_REVOKE_STATUS}\`
 
@@ -307,6 +308,7 @@ REPORT_EOF
 }
 
 cleanup() {
+  set +e
   echo ""
   echo "==> Cleaning up test instances and temporary directories..."
   "${DEPLOYER_SCRIPT}" --mode uninstall --dir "${TEST_DIR}/auth" >/dev/null 2>&1 || true
@@ -329,20 +331,22 @@ if [[ -n "${TS_API_KEY}" ]]; then
   echo "================================================================================"
 
   echo "==> [STAGE 1/6] Minting Ephemeral Auth Key via Tailscale REST API..."
+  AUTH_PAYLOAD=$(jq -n '{
+    capabilities: {
+      devices: {
+        create: {
+          reusable: false,
+          ephemeral: true,
+          preauthorized: true
+        }
+      }
+    }
+  }')
+
   KEY_RESP=$(curl -s -w "\n%{http_code}" -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
     -H "Authorization: Bearer ${TS_API_KEY}" \
     -H "Content-Type: application/json" \
-    -d '{
-      "capabilities": {
-        "devices": {
-          "create": {
-            "reusable": false,
-            "ephemeral": true,
-            "preauthorized": true
-          }
-        }
-      }
-    }')
+    -d "${AUTH_PAYLOAD}")
 
   HTTP_CODE=$(echo "${KEY_RESP}" | tail -n 1)
   BODY=$(echo "${KEY_RESP}" | sed '$d')
@@ -461,38 +465,67 @@ OAUTH_CLIENT_SECRET="${TS_OAUTH_KEY}"
 CREATED_OAUTH_BY_API="false"
 
 if [[ -z "${OAUTH_CLIENT_SECRET}" && -n "${TS_API_KEY}" ]]; then
-  echo "==> [STAGE 1/6] Minting OAuth Client via Tailscale REST API..."
+  echo "==> [STAGE 1/6] Inspecting Tailnet ACL and Minting OAuth Client via Tailscale REST API..."
+  
+  # Discover or configure ACL tags
+  CHOSEN_TAG="tag:pihole"
+  ACL_RESP=$(curl -s -H "Authorization: Bearer ${TS_API_KEY}" "https://api.tailscale.com/api/v2/tailnet/-/acl" 2>/dev/null || true)
+  
+  if echo "${ACL_RESP}" | jq -e '.tagOwners' >/dev/null 2>&1; then
+    if echo "${ACL_RESP}" | jq -e '.tagOwners["tag:pihole"]' >/dev/null 2>&1; then
+      CHOSEN_TAG="tag:pihole"
+      echo "  [✓] Found 'tag:pihole' in Tailnet ACL tagOwners."
+    else
+      FIRST_TAG=$(echo "${ACL_RESP}" | jq -r '.tagOwners | keys[0] // empty')
+      if [[ -n "${FIRST_TAG}" && "${FIRST_TAG}" != "null" ]]; then
+        CHOSEN_TAG="${FIRST_TAG}"
+        echo "  [✓] Using existing Tailnet ACL tag: ${CHOSEN_TAG}"
+      else
+        echo "  [INFO] Adding 'tag:pihole' to Tailnet ACL policy..."
+        UPDATED_ACL=$(echo "${ACL_RESP}" | jq '.tagOwners = (.tagOwners // {}) | .tagOwners["tag:pihole"] = ["autogroup:admin", "autogroup:members"]')
+        curl -s -X POST "https://api.tailscale.com/api/v2/tailnet/-/acl" \
+          -H "Authorization: Bearer ${TS_API_KEY}" \
+          -H "Content-Type: application/json" \
+          -d "${UPDATED_ACL}" >/dev/null 2>&1 || true
+        CHOSEN_TAG="tag:pihole"
+      fi
+    fi
+  fi
+  OAUTH_TAG_USED="${CHOSEN_TAG}"
+
+  OAUTH_PAYLOAD=$(jq -n \
+    --arg name "pihole-automated-test-client" \
+    --arg desc "Temporary client for automated Pi-hole deployment testing" \
+    --arg tag "${OAUTH_TAG_USED}" \
+    '{name: $name, description: $desc, scopes: ["devices:core"], tags: [$tag]}')
+
   OAUTH_RESP=$(curl -s -w "\n%{http_code}" -X POST "https://api.tailscale.com/api/v2/tailnet/-/oauth-clients" \
     -H "Authorization: Bearer ${TS_API_KEY}" \
     -H "Content-Type: application/json" \
-    -d '{
-      "name": "pihole-automated-test-client",
-      "description": "Temporary client for automated Pi-hole deployment testing",
-      "scopes": ["devices:core"],
-      "tags": ["tag:pihole"]
-    }')
+    -d "${OAUTH_PAYLOAD}")
 
   HTTP_CODE=$(echo "${OAUTH_RESP}" | tail -n 1)
   BODY=$(echo "${OAUTH_RESP}" | sed '$d')
 
   if [[ "${HTTP_CODE}" -ne 200 && "${HTTP_CODE}" -ne 201 ]]; then
     echo "⚠️  Note: Dynamic OAuth Client creation returned HTTP ${HTTP_CODE}: ${BODY}"
-    echo "    (Dynamic OAuth minting requires 'tagOwners' with 'tag:pihole' in your Tailscale ACL policy)"
-    echo "    You can supply a pre-created OAuth key via: export TS_OAUTH_KEY=\"tskey-client-...\""
+    echo "    (Dynamic OAuth minting requires 'tagOwners' with '${OAUTH_TAG_USED}' in your Tailscale ACL policy or an admin API key)"
+    echo "    You can also supply a pre-created OAuth key via: export TS_OAUTH_KEY=\"tskey-client-...\""
     OAUTH_STATUS="SKIPPED (ACL / Scope Requirement: ${BODY})"
   else
     OAUTH_CLIENT_SECRET=$(echo "${BODY}" | jq -r '.secret // empty')
     OAUTH_CLIENT_ID=$(echo "${BODY}" | jq -r '.id // empty')
     CREATED_OAUTH_BY_API="true"
     echo "  [✓] OAuth Client Created: ID=${OAUTH_CLIENT_ID}"
+    echo "  [✓] Assigned ACL Tag: ${OAUTH_TAG_USED}"
     echo "  [✓] OAuth Secret Prefix: ${OAUTH_CLIENT_SECRET:0:18}..."
   fi
 fi
 
 if [[ -n "${OAUTH_CLIENT_SECRET}" ]]; then
   echo ""
-  echo "==> [STAGE 2/6] Deploying Topology 3 with OAuth Client and Auto-Tagging..."
-  "${DEPLOYER_SCRIPT}" --mode tailscale --dir "${TEST_DIR}/oauth" --tailscale-key "${OAUTH_CLIENT_SECRET}" --tailscale-tag "tag:pihole" --password "TestSecretOAuth2026!"
+  echo "==> [STAGE 2/6] Deploying Topology 3 with OAuth Client and Auto-Tagging (${OAUTH_TAG_USED})..."
+  "${DEPLOYER_SCRIPT}" --mode tailscale --dir "${TEST_DIR}/oauth" --tailscale-key "${OAUTH_CLIENT_SECRET}" --tailscale-tag "${OAUTH_TAG_USED}" --password "TestSecretOAuth2026!"
 
   # Capture generated files
   if [[ -f "${TEST_DIR}/oauth/.env" ]]; then

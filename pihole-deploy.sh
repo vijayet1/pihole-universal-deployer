@@ -134,7 +134,7 @@ configure_system_dns_and_ports() {
   local need_sysctl_update="false"
   if (( current_port_start > 53 )); then
     need_sysctl_update="true"
-  elif [[ ! -f "${sysctl_conf}" ]] && ! grep -Ers "ip_unprivileged_port_start[[:space:]]*=[[:space:]]*53" /etc/sysctl.d/ /etc/sysctl.conf 2>/dev/null; then
+  elif [[ ! -f "${sysctl_conf}" ]] && ! grep -q -r -s -E "ip_unprivileged_port_start[[:space:]]*=[[:space:]]*53" /etc/sysctl.d/ /etc/sysctl.conf 2>/dev/null; then
     need_sysctl_update="true"
   elif [[ -f "${sysctl_conf}" ]] && [[ -f /proc/sys/net/ipv6/ip_unprivileged_port_start ]] && ! grep -q "net.ipv6.ip_unprivileged_port_start=53" "${sysctl_conf}"; then
     need_sysctl_update="true"
@@ -153,24 +153,29 @@ configure_system_dns_and_ports() {
   if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
     log_info "systemd-resolved is active. Checking for port 53 stub conflicts..."
     local resolved_dir="/etc/systemd/resolved.conf.d"
-    run_privileged mkdir -p "${resolved_dir}"
-
-    # Create no-stub override
     local stub_conf="${resolved_dir}/no-stub.conf"
+    local docker_stub="${resolved_dir}/20-docker-dns.conf"
+    local need_resolved_restart="false"
+
+    # Create no-stub override if missing
     if [[ ! -f "${stub_conf}" ]]; then
       log_info "Disabling systemd-resolved DNSStubListener..."
+      run_privileged mkdir -p "${resolved_dir}"
       printf "[Resolve]\nDNSStubListener=no\n" | run_privileged tee "${stub_conf}" >/dev/null
+      need_resolved_restart="true"
     fi
 
     # Disable conflicting Docker extra stubs (e.g. 20-docker-dns.conf)
-    local docker_stub="${resolved_dir}/20-docker-dns.conf"
     if [[ -f "${docker_stub}" ]]; then
       log_warn "Found conflicting Docker stub listener (${docker_stub}). Disabling it..."
       run_privileged mv "${docker_stub}" "${docker_stub}.disabled"
+      need_resolved_restart="true"
     fi
 
-    log_info "Restarting systemd-resolved..."
-    run_privileged systemctl restart systemd-resolved || true
+    if [[ "${need_resolved_restart}" == "true" ]]; then
+      log_info "Restarting systemd-resolved..."
+      run_privileged systemctl restart systemd-resolved || true
+    fi
     log_success "systemd-resolved configured without port 53 conflict."
   fi
 
@@ -269,7 +274,9 @@ deploy_container() {
   cat <<EOF > "${env_file}"
 TZ=${TIMEZONE}
 WEBPASSWORD=${ADMIN_PASSWORD}
+FTLCONF_webserver_api_password=${ADMIN_PASSWORD}
 FTLCONF_dns_listeningMode=all
+FTLCONF_dns_upstreams=1.1.1.1;8.8.8.8
 PIHOLE_DNS_1=1.1.1.1
 PIHOLE_DNS_2=8.8.8.8
 EOF
@@ -282,6 +289,7 @@ services:
   pihole:
     container_name: pihole
     image: docker.io/pihole/pihole:latest
+    network_mode: "bridge"
     restart: unless-stopped
     dns:
       - 1.1.1.1
@@ -293,7 +301,9 @@ services:
     environment:
       - TZ=\${TZ}
       - WEBPASSWORD=\${WEBPASSWORD}
+      - FTLCONF_webserver_api_password=\${FTLCONF_webserver_api_password}
       - FTLCONF_dns_listeningMode=\${FTLCONF_dns_listeningMode}
+      - FTLCONF_dns_upstreams=\${FTLCONF_dns_upstreams}
       - PIHOLE_DNS_1=\${PIHOLE_DNS_1}
       - PIHOLE_DNS_2=\${PIHOLE_DNS_2}
     volumes:
@@ -320,8 +330,10 @@ EOF
 
   # 4. Configure Systemd User Service & Linger for Boot Autostart
   if [[ "${CONTAINER_ENGINE}" == "podman" && "${ENABLE_SYSTEMD}" == "true" ]]; then
-    log_info "Enabling systemd linger for user ${USER}..."
-    run_privileged loginctl enable-linger "${USER}" 2>/dev/null || true
+    if [[ "$(loginctl show-user "${USER}" --property=Linger 2>/dev/null)" != "Linger=yes" ]]; then
+      log_info "Enabling systemd linger for user ${USER}..."
+      loginctl enable-linger "${USER}" 2>/dev/null || run_privileged loginctl enable-linger "${USER}" 2>/dev/null || true
+    fi
   fi
 
   log_success "Pi-hole container deployed successfully!"
@@ -361,6 +373,8 @@ deploy_tailscale_sidecar() {
 TS_AUTHKEY=${TAILSCALE_KEY}
 TZ=${TIMEZONE}
 WEBPASSWORD=${ADMIN_PASSWORD}
+FTLCONF_webserver_api_password=${ADMIN_PASSWORD}
+FTLCONF_dns_upstreams=1.1.1.1;8.8.8.8
 EOF
 
   # 2. Create serve.json for Tailscale Serve (HTTPS 443 -> HTTP 80)
@@ -429,7 +443,9 @@ $( [[ -n "${extra_args}" ]] && echo "      - TS_EXTRA_ARGS=${extra_args}" )
     environment:
       - TZ=\${TZ}
       - WEBPASSWORD=\${WEBPASSWORD}
+      - FTLCONF_webserver_api_password=\${FTLCONF_webserver_api_password}
       - FTLCONF_dns_listeningMode=all
+      - FTLCONF_dns_upstreams=\${FTLCONF_dns_upstreams}
       - FTLCONF_webserver_port=80
       - PIHOLE_DNS_1=1.1.1.1
       - PIHOLE_DNS_2=8.8.8.8
@@ -517,7 +533,11 @@ run_uninstall() {
     log_info "[DRY-RUN] Would remove deployment directory: ${TARGET_DIR}"
   elif [[ -d "${TARGET_DIR}" ]]; then
     log_warn "Removing deployment directory: ${TARGET_DIR}"
-    rm -rf "${TARGET_DIR}"
+    if command -v podman &>/dev/null; then
+      podman unshare rm -rf "${TARGET_DIR}" 2>/dev/null || rm -rf "${TARGET_DIR}" 2>/dev/null || run_privileged rm -rf "${TARGET_DIR}" || true
+    else
+      rm -rf "${TARGET_DIR}" 2>/dev/null || run_privileged rm -rf "${TARGET_DIR}" || true
+    fi
   fi
 
   log_success "Pi-hole deployment has been uninstalled."

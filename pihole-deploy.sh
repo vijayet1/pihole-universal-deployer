@@ -592,7 +592,18 @@ run_healthcheck() {
   fi
 
   # Check Web Admin Response
+  local web_responding="false"
   if curl -sI http://127.0.0.1:8080/admin/ >/dev/null 2>&1 || curl -sI http://127.0.0.1/admin/ >/dev/null 2>&1 || curl -k -sI https://127.0.0.1/admin/ >/dev/null 2>&1; then
+    web_responding="true"
+  elif [[ -n "${ts_ip:-}" ]] && (curl -k -sI --max-time 3 "https://${ts_ip}/admin/" >/dev/null 2>&1 || curl -sI --max-time 3 "http://${ts_ip}/admin/" >/dev/null 2>&1); then
+    web_responding="true"
+  elif command -v podman &>/dev/null && podman exec pihole curl -sI http://127.0.0.1:80/admin/ >/dev/null 2>&1; then
+    web_responding="true"
+  elif command -v docker &>/dev/null && docker exec pihole curl -sI http://127.0.0.1:80/admin/ >/dev/null 2>&1; then
+    web_responding="true"
+  fi
+
+  if [[ "${web_responding}" == "true" ]]; then
     log_success "[PASS] Web Admin dashboard is responding."
     ((passed++)) || true
   else
